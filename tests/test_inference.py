@@ -7,7 +7,7 @@ from beat_this.inference import File2Beats, Audio2Frames
 
 
 def test_File2Beat():
-    f2b = File2Beats()
+    f2b = File2Beats(device='cuda', float16=True)
     audio_path = Path("tests/It Don't Mean A Thing - Kings of Swing.mp3")
     beat, downbeat = f2b(audio_path)
     assert isinstance(beat, np.ndarray)

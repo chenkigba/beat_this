@@ -4,8 +4,9 @@ import torchaudio
 
 
 def load_audio(path, dtype="float64"):
+    loader = getattr(torchaudio, 'load_with_torchcodec', torchaudio.load)
     try:
-        waveform, samplerate = torchaudio.load(path, channels_first=False)
+        waveform, samplerate = loader(path, channels_first=False)
         waveform = np.asanyarray(waveform.squeeze().numpy(), dtype=dtype)
         return waveform, samplerate
     except Exception:
