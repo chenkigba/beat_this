@@ -4,6 +4,9 @@ import numpy as np
 import soxr
 import torch
 import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor, Future
+import warnings
+
 
 from beat_this.model.beat_tracker import BeatThis
 from beat_this.model.postprocessor import Postprocessor
@@ -11,6 +14,73 @@ from beat_this.preprocessing import LogMelSpect, load_audio
 from beat_this.utils import replace_state_dict_key, save_beat_tsv
 
 CHECKPOINT_URL = "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp"
+
+# -----------------------
+# 预加载：全局单线程 + Future 复用
+# -----------------------
+
+
+_preload_executor: ThreadPoolExecutor | None = None
+_preload_future: Future | None = None
+_preload_args: dict | None = None  # {"checkpoint_path": str, "device": str}
+
+
+def _normalize_device_str(device: str | torch.device) -> str:
+    try:
+        return str(torch.device(device))
+    except Exception:
+        return str(device)
+
+
+def _load_model_impl(checkpoint_path: str | None, device: str | torch.device) -> BeatThis:
+    # 轻量后端优化（保持保守，不引入 compile/量化 等）
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True  # 允许 TF32
+        except Exception:
+            pass
+    dev = torch.device(device)
+    return load_model(checkpoint_path, dev)
+
+
+def preload(checkpoint_path: str | None = "final0", device: str | torch.device = "cpu") -> Future:
+    """
+    后台异步预加载 BeatThis 模型（幂等，单次加载）。
+    - 若已存在正在/已完成的预加载，将直接复用该 Future；若参数不同，将发出警告并忽略新请求。
+    - 返回 concurrent.futures.Future，可选择等待 .result() 获取模型。
+    """
+    global _preload_executor, _preload_future, _preload_args
+    req_args = {"checkpoint_path": str(checkpoint_path), "device": _normalize_device_str(device)}
+
+    if _preload_future is not None:
+        if _preload_args != req_args:
+            warnings.warn(
+                f"beat_this.preload 已存在，忽略新的参数请求：现有={_preload_args}, 新请求={req_args}",
+                RuntimeWarning,
+            )
+        return _preload_future
+
+    if _preload_executor is None:
+        _preload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="beat_this_preload")
+
+    _preload_args = req_args
+    _preload_future = _preload_executor.submit(_load_model_impl, checkpoint_path, device)
+    return _preload_future
+
+
+def setup(checkpoint_path: str | None = "final0", device: str | torch.device = "cpu") -> BeatThis:
+    """
+    推理侧统一入口：
+    - 若已预加载，阻塞等待并复用该模型；
+    - 若未预加载，则同步加载一次并返回。
+    """
+    if _preload_future is not None:
+        return _preload_future.result()
+    return _load_model_impl(checkpoint_path, device)
 
 
 def load_checkpoint(checkpoint_path: str, device: str | torch.device = "cpu") -> dict:
@@ -241,7 +311,7 @@ class Spect2Frames:
         super().__init__()
         self.device = torch.device(device)
         self.float16 = float16
-        self.model = load_model(checkpoint_path, self.device)
+        self.model = setup(checkpoint_path, self.device)
 
     def spect2frames(self, spect):
         with torch.inference_mode():
